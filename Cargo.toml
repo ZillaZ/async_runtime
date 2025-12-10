@@ -1,0 +1,8 @@
+[package]
+name = "noir_runtime_lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flume = "*"
+libc = "*"
