@@ -125,6 +125,40 @@ impl Future for FdRead {
     }
 }
 
+pub struct SocketConnect {
+    stream: TcpStream,
+    started: bool
+}
+
+impl Future for SocketConnect {
+    type Output = Result<TcpStream, std::io::Error>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        let fd = self.stream.fd;
+        let token = self.stream.token;
+        if !self.started {
+            self.stream.poll.register(fd, token, libc::EPOLLOUT as u32);
+            self.started = true;
+            return StdPoll::Pending;
+        }
+        let (mut val, mut size) = (0, std::mem::size_of::<i32>());
+        let result = unsafe { libc::getsockopt(self.stream.fd, libc::SOL_SOCKET, libc::SO_ERROR, std::mem::transmute(&mut val), std::mem::transmute(&mut size)) };
+        if result < 0 {
+            println!("ERROR {result}");
+            let err = std::io::Error::last_os_error();
+            if let Some(e) = err.raw_os_error() {
+                if e == libc::EINPROGRESS {
+                    self.stream.poll.reregister(fd, token, libc::EPOLLOUT as u32);
+                    return StdPoll::Pending;
+                }
+            }
+            self.stream.poll.deregister(fd);
+            return StdPoll::Ready(Err(err));
+        }
+        self.stream.poll.deregister(fd);
+        StdPoll::Ready(Ok(self.stream.clone()))
+    }
+}
+
 pub struct FdWrite {
     poll: Poll,
     fd: i32,
@@ -171,6 +205,7 @@ impl Future for FdWrite {
     }
 }
 
+#[derive(Clone)]
 pub struct TcpStream {
     poll: Poll,
     fd: i32,
@@ -180,6 +215,22 @@ pub struct TcpStream {
 impl TcpStream {
     pub fn new(poll: Poll, fd: i32, token: u64) -> Self {
         Self { poll, fd, token }
+    }
+
+    pub fn new_client(poll: Poll, addr: &str, token: u64) -> Result<Self, std::io::Error> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sockaddr = str_to_sockaddr(addr)?;
+        let conn_result = unsafe { libc::connect(fd, std::mem::transmute(&sockaddr), std::mem::size_of::<libc::sockaddr_in>() as u32) };
+        if conn_result < 0 && conn_result != libc::EINPROGRESS {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error().unwrap() != libc::EINPROGRESS {
+                return Err(err);
+            }
+        }
+        Ok(Self { poll, fd, token })
     }
 }
 
@@ -225,6 +276,23 @@ impl Future for Listener {
     }
 }
 
+fn str_to_sockaddr(addr: &str) -> Result<libc::sockaddr_in, std::io::Error> {
+    let slice = addr.split(":").collect::<Vec<&str>>();
+    if slice.len() != 2 {
+        return Err(std::io::ErrorKind::InvalidInput.into())
+    }
+    let Ok(port) = slice[1].parse::<u16>() else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
+    let port = port.to_be();
+    let Ok(addr) = slice[0].parse::<std::net::Ipv4Addr>() else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
+    let addr = u32::from(addr).to_be();
+    let sockaddr = libc::sockaddr_in { sin_port: port, sin_addr: libc::in_addr { s_addr: addr }, sin_zero: [0; 8], sin_family: libc::AF_INET as u16 };
+    Ok(sockaddr)
+}
+
 pub struct TcpListener {
     poll: Poll,
     fd: i32,
@@ -241,19 +309,7 @@ impl TcpListener {
             }
             fd
         };
-        let slice = addr.split(":").collect::<Vec<&str>>();
-        if slice.len() != 2 {
-            return Err(std::io::ErrorKind::InvalidInput.into())
-        }
-        let Ok(port) = slice[1].parse::<u16>() else {
-            return Err(std::io::ErrorKind::InvalidInput.into());
-        };
-        let port = port.to_be();
-        let Ok(addr) = slice[0].parse::<std::net::Ipv4Addr>() else {
-            return Err(std::io::ErrorKind::InvalidInput.into());
-        };
-        let addr = u32::from(addr).to_be();
-        let sockaddr = libc::sockaddr_in { sin_port: port, sin_addr: libc::in_addr { s_addr: addr }, sin_zero: [0; 8], sin_family: libc::AF_INET as u16 };
+        let sockaddr = str_to_sockaddr(addr)?;
         Ok(Self { poll, fd, sockaddr, token })
     }
 
@@ -338,6 +394,7 @@ impl Wake for Waker {
 
 type AsyncTask<'a> = Pin<&'a mut dyn Future<Output = ()>>;
 
+#[derive(Clone)]
 pub struct Sleeper {
     poll: Poll,
     token: u64
@@ -355,6 +412,7 @@ impl Sleeper {
     }
 }
 
+#[derive(Clone)]
 pub struct Utils {
     poll: Poll,
     token: u64,
@@ -377,6 +435,11 @@ impl Utils {
 
     pub fn open_file<T: ToString>(&self, path: T) -> Result<File, std::io::Error> {
         File::open(path, libc::O_RDWR, self.token, self.signal_sender.clone())
+    }
+
+    pub fn new_tcp_client(&self, addr: &str) -> SocketConnect {
+        let stream = TcpStream::new_client(self.poll.clone(), addr, self.token).unwrap();
+        SocketConnect { stream, started: false }
     }
 }
 
@@ -494,6 +557,7 @@ pub fn new_waker() -> std::task::Waker {
     std::task::Waker::from(Arc::new(Waker::new()))
 }
 
+#[macro_export]
 macro_rules! push_task {
     ($runtime:ident, $task:expr) => {
         let utils = $runtime.get_utils();
