@@ -1,34 +1,31 @@
-use std::{collections::HashMap, ffi::{c_int, CString}, pin::{pin, Pin}, sync::{mpsc::{channel, Receiver, Sender}, Arc}, task::{Context, Poll as StdPoll, Wake}};
+use std::{collections::HashMap, ffi::CString, pin::Pin, sync::{mpsc::{channel, Receiver, Sender}, Arc, LazyLock, Mutex}, task::{Context, Poll as StdPoll, Wake}};
+use uring_lib::{read_cq, setup_io_uring, setup_rings, write_sq, IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_LISTEN, IORING_OP_READ, IORING_OP_WRITE};
 
 pub trait AsyncRead {
-    async fn read(&mut self) -> Result<Vec<u8>, std::io::Error>;
+    fn read(&mut self) -> impl Future<Output = Result<Vec<u8>, std::io::Error>> + Send + Sync;
 }
 
 pub trait AsyncWrite {
-    async fn write(&mut self, vec: Vec<u8>) -> Result<usize, std::io::Error>;
+    fn write(&mut self, vec: Vec<u8>) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync;
 }
 
 pub struct File {
     fd: i32,
-    token: u64,
-    sender: Sender<u64>,
 }
 
 impl File {
-    pub fn open<T: ToString>(path: T, flags: i32, token: u64, sender: Sender<u64>) -> Result<Self, std::io::Error> {
+    pub fn open<T: ToString>(path: T, flags: i32) -> Result<Self, std::io::Error> {
         use std::str::FromStr;
         let Ok(cstr) = CString::from_str(path.to_string().as_str()) else {
             return Err(std::io::ErrorKind::Other.into())
         };
         let fd = unsafe { libc::open(cstr.as_c_str().as_ptr(), flags) };
-        Ok(Self { fd, token, sender })
+        Ok(Self { fd })
     }
 }
 
 pub struct FileRead {
     fd: i32,
-    token: u64,
-    sender: Sender<u64>,
     buffer: Vec<u8>
 }
 
@@ -68,211 +65,277 @@ impl Future for FileWrite {
     }
 }
 
+use uring_lib::MutVoidPtr;
+
 #[allow(refining_impl_trait)]
 impl AsyncRead for File {
-     fn read(&mut self) -> FileRead {
-         FileRead { fd: self.fd, token: self.token, sender: self.sender.clone(), buffer: Vec::with_capacity(1024) }
+     fn read(&mut self) -> FdRead {
+         FdRead { fd: self.fd, inner_buffer: Vec::with_capacity(1024), tb: [0; 1024], len: 1024, info: InfoPtr { processed: false, n: 0, err: 0, buffer: MutVoidPtr(std::ptr::null_mut()) }, started: false, acc: Vec::with_capacity(1024) }
      }
 }
 
 #[allow(refining_impl_trait)]
 impl AsyncWrite for File {
-    fn write(&mut self, vec: Vec<u8>) -> FileWrite {
-         FileWrite { fd: self.fd, token: self.token, sender: self.sender.clone(), buffer: vec }
+    fn write(&mut self, vec: Vec<u8>) -> FdWrite {
+         FdWrite { fd: self.fd, offset: 0, started: false, info: InfoPtr { processed: false, n: 0, err: 0, buffer: MutVoidPtr(std::ptr::null_mut()) }, inner_buffer: Vec::with_capacity(1024) }
      }
 }
 
 pub struct FdRead {
-    poll: Poll,
     fd: i32,
-    buffer: Vec<u8>,
-    token: u64,
-    started: bool
+    inner_buffer: Vec<u8>,
+    tb: [u8; 1024],
+    len: usize,
+    info: InfoPtr,
+    started: bool,
+    acc: Vec<u8>,
 }
+
+impl FdRead {
+    fn setup_poll(&mut self) {
+        POLL.with(|poll| {
+            let mut poll = poll.lock().unwrap();
+            let sqe = poll.get_task();
+            let fd = self.fd;
+            let len = self.len;
+            unsafe {
+                self.info.buffer = std::mem::transmute(&mut self.tb);
+                (*sqe).fd = fd;
+                (*sqe).len = len as u32;
+                (*sqe).addr_u.addr = std::mem::transmute(self.info.buffer);
+                (*sqe).user_data = &mut self.info as *mut InfoPtr as usize as u64;
+                (*sqe).opcode = IORING_OP_READ;
+                (*sqe).off_u.off = u64::MAX;
+            }
+            poll.register();
+        });
+    }
+}
+
+use std::ops::{Deref, DerefMut};
 
 impl Future for FdRead {
     type Output = Result<Vec<u8>, std::io::Error>;
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> StdPoll<Self::Output> {
         if !self.started {
-            let fd = self.fd;
-            let token = self.token;
-            self.poll.register(fd, token, libc::EPOLLIN as u32);
+            self.setup_poll();
             self.started = true;
             return StdPoll::Pending;
         }
-        let mut temp : [u8; 1024] = [0; 1024];
-        let read = unsafe {
-            libc::read(self.fd, std::mem::transmute(temp.as_mut_ptr()), 1024)
-        };
-        self.buffer.extend(&temp[..read as usize]);
-        let read = unsafe {
-            libc::read(self.fd, std::mem::transmute(temp.as_mut_ptr()), 1)
-        };
-        if read > 0 {
-            self.buffer.extend(&temp[..read as usize]);
+        if self.info.err != 0 {
+            return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(self.info.err)))
         }
-        let err = std::io::Error::last_os_error();
-        if (read < 0 && err.kind() == std::io::ErrorKind::WouldBlock) || read == 0 {
-            let fd = self.fd;
-            self.poll.deregister(fd);
-            StdPoll::Ready(Ok(self.buffer.clone()))
-        }else{
-            let fd = self.fd;
-            let token = self.token;
-            self.poll.reregister(fd, token, libc::EPOLLIN as u32);
-            StdPoll::Pending
+        let b : *mut [u8; 1024] = std::ptr::with_exposed_provenance_mut(self.info.buffer.0 as usize);
+        let n = self.info.n;
+        unsafe{
+            self.inner_buffer.extend(&(&*b)[..n as usize]);
         }
+        let i = self.inner_buffer.clone();
+        self.acc.extend(i);
+        StdPoll::Ready(Ok(self.acc.clone()))
     }
 }
 
 pub struct SocketConnect {
     stream: TcpStream,
-    started: bool
+    started: bool,
+    info: InfoPtr,
+    sockaddr: libc::sockaddr_in,
+    len: u32
+}
+
+impl SocketConnect {
+    fn setup_poll(&mut self) {
+        let fd = self.stream.fd;
+        POLL.with(|poll| {
+           let mut poll = poll.lock().unwrap();
+            let sqe = poll.get_task();
+            unsafe {
+                (*sqe).fd = fd;
+                (*sqe).user_data = &mut self.info as *mut InfoPtr as usize as u64;
+                (*sqe).opcode = IORING_OP_CONNECT;
+                (*sqe).len = 0;
+                (*sqe).addr_u.addr = std::mem::transmute(&mut self.sockaddr);
+                (*sqe).off_u.off = self.len as u64;
+            }
+            poll.register();
+        });
+    }
 }
 
 impl Future for SocketConnect {
     type Output = Result<TcpStream, std::io::Error>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
-        let fd = self.stream.fd;
-        let token = self.stream.token;
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        println!("connecting...");
         if !self.started {
-            self.stream.poll.register(fd, token, libc::EPOLLOUT as u32);
+            self.setup_poll();
             self.started = true;
             return StdPoll::Pending;
         }
-        let (mut val, mut size) = (0, std::mem::size_of::<i32>());
-        let result = unsafe { libc::getsockopt(self.stream.fd, libc::SOL_SOCKET, libc::SO_ERROR, std::mem::transmute(&mut val), std::mem::transmute(&mut size)) };
-        if result < 0 {
-            println!("ERROR {result}");
-            let err = std::io::Error::last_os_error();
-            if let Some(e) = err.raw_os_error() {
-                if e == libc::EINPROGRESS {
-                    self.stream.poll.reregister(fd, token, libc::EPOLLOUT as u32);
-                    return StdPoll::Pending;
-                }
-            }
-            self.stream.poll.deregister(fd);
-            return StdPoll::Ready(Err(err));
+        if !self.info.processed {
+            return StdPoll::Pending
         }
-        self.stream.poll.deregister(fd);
+        if self.info.err != 0 {
+            println!("SocketConnect died with code {}", self.info.err);
+            return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(self.info.err)));
+        }
         StdPoll::Ready(Ok(self.stream.clone()))
     }
 }
 
 pub struct FdWrite {
-    poll: Poll,
     fd: i32,
-    buffer: Vec<u8>,
-    token: u64,
     offset: usize,
-    started: bool
+    started: bool,
+    info: InfoPtr,
+    inner_buffer: Vec<u8>
+}
+
+impl FdWrite {
+    fn setup_poll(&mut self) {
+        let fd = self.fd;
+        POLL.with(|poll| {
+            let mut poll = poll.lock().unwrap();
+            let to_write = self.inner_buffer.len() - self.offset;
+            unsafe {
+                let sqe = poll.get_task();
+                (*sqe).fd = fd;
+                (*sqe).len = to_write as u32;
+                (*sqe).addr_u.addr = std::mem::transmute(self.inner_buffer.as_mut_ptr().wrapping_add(self.offset));
+                (*sqe).opcode = IORING_OP_WRITE;
+                (*sqe).user_data = &mut self.info as *mut InfoPtr as u64;
+            }
+            poll.register();
+        });
+    }
 }
 
 impl Future for FdWrite {
     type Output = Result<usize, std::io::Error>;
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        println!("writing...");
+        if self.inner_buffer.is_empty() { return StdPoll::Ready(Ok(0)); }
         if !self.started {
-            let fd = self.fd;
-            let token = self.token;
-            self.poll.register(fd, token, libc::EPOLLOUT as u32);
+            self.setup_poll();
             self.started = true;
             return StdPoll::Pending;
         }
-        let offset = self.offset;
-        let buffer = self.buffer[offset..].as_mut_ptr();
-        let written = unsafe { libc::write(self.fd, std::mem::transmute(buffer), self.buffer.len() - offset) };
-        if written < 0 {
-            let error = std::io::Error::last_os_error();
-            return if error.kind() == std::io::ErrorKind::WouldBlock {
-                StdPoll::Ready(Ok(self.offset))
-            }else{
-                let fd = self.fd;
-                self.poll.deregister(fd);
-                StdPoll::Ready(Err(error))
-            }
+        if !self.info.processed {
+            return StdPoll::Pending;
         }
-        self.offset += written as usize;
-        if offset == self.buffer.len() {
-            let fd = self.fd;
-            self.poll.deregister(fd);
-            StdPoll::Ready(Ok(self.offset))
-        }else{
-            let fd = self.fd;
-            let token = self.token;
-            self.poll.reregister(fd, token, libc::EPOLLOUT as u32);
-            StdPoll::Pending
+        if self.info.err != 0 {
+            return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(self.info.err)));
         }
+        self.offset += self.info.n as usize;
+        if self.offset == self.inner_buffer.len() {
+            return StdPoll::Ready(Ok(self.offset));
+        }
+        self.info.processed = false;
+        self.setup_poll();
+        StdPoll::Pending
     }
 }
 
 #[derive(Clone)]
 pub struct TcpStream {
-    poll: Poll,
-    fd: i32,
-    token: u64
+    fd: i32
 }
 
 impl TcpStream {
-    pub fn new(poll: Poll, fd: i32, token: u64) -> Self {
-        Self { poll, fd, token }
+    pub fn new(fd: i32) -> Self {
+        Self { fd }
     }
 
-    pub fn new_client(poll: Poll, addr: &str, token: u64) -> Result<Self, std::io::Error> {
+    pub fn new_client(addr: &str) -> Result<SocketConnect, std::io::Error> {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
         let sockaddr = str_to_sockaddr(addr)?;
-        let conn_result = unsafe { libc::connect(fd, std::mem::transmute(&sockaddr), std::mem::size_of::<libc::sockaddr_in>() as u32) };
-        if conn_result < 0 && conn_result != libc::EINPROGRESS {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error().unwrap() != libc::EINPROGRESS {
-                return Err(err);
-            }
-        }
-        Ok(Self { poll, fd, token })
+        Ok(SocketConnect { stream: Self { fd }, started: false, info: InfoPtr { processed: false, n: 0, err: 0, buffer: MutVoidPtr(std::ptr::null_mut()) }, sockaddr, len: std::mem::size_of::<libc::sockaddr_in>() as u32 })
     }
 }
 
 #[allow(refining_impl_trait)]
 impl AsyncRead for TcpStream {
     fn read(&mut self) -> FdRead {
-        FdRead { poll: self.poll.clone(), fd: self.fd, token: self.token, buffer: Vec::with_capacity(1024), started: false }
+        FdRead { fd: self.fd, acc: Vec::with_capacity(1024), started: false, len: 1024, info: InfoPtr { processed: false, n: 0, err: 0, buffer: MutVoidPtr(std::ptr::null_mut()) }, inner_buffer: Vec::new(), tb: [0; 1024] }
     }
 }
 
 #[allow(refining_impl_trait)]
 impl AsyncWrite for TcpStream {
     fn write(&mut self, buffer: Vec<u8>) -> FdWrite {
-        FdWrite { poll: self.poll.clone(), fd: self.fd, token: self.token, buffer, offset: 0, started: false }
+        FdWrite { fd: self.fd, offset: 0, started: false, info: InfoPtr { processed: false, n: 0, err: 0, buffer: MutVoidPtr(std::ptr::null_mut()) }, inner_buffer: buffer }
     }
 }
 
 pub struct Listener {
-    poll: Poll,
     fd: i32,
-    token: u64,
+    info: InfoPtr,
+    started: bool,
+    sockaddr: libc::sockaddr,
+    len: u64,
+}
+
+impl Listener {
+    fn setup_poll(&mut self) {
+        let fd = self.fd;
+        POLL.with(|poll| {
+            let mut poll = poll.lock().unwrap();
+            let sqe = poll.get_task();
+            self.info.n = unsafe { std::mem::transmute(&mut self.info) };
+            unsafe {
+                (*sqe).opcode = IORING_OP_LISTEN;
+                (*sqe).len = 0;
+                (*sqe).user_data = &mut self.info as *mut InfoPtr as u64;
+                (*sqe).fd = fd;
+            }
+            poll.register();
+        });
+    }
+
+    fn accept(&mut self) {
+        POLL.with(|poll| {
+            let mut poll = poll.lock().unwrap();
+            let sqe = poll.get_task();
+            let fd = self.fd;
+            unsafe {
+                self.info.buffer = std::mem::transmute(&mut self.sockaddr);
+                let len = std::mem::transmute(&mut self.len);
+                (*sqe).opcode = IORING_OP_ACCEPT;
+                (*sqe).len = 0;
+                (*sqe).user_data = &mut self.info as *mut InfoPtr as u64;
+                (*sqe).off_u.addr2 = len;
+                (*sqe).addr_u.addr = std::mem::transmute(&mut self.sockaddr);
+                (*sqe).fd = fd;
+                (*sqe).oflags.accept_flags = libc::SOCK_NONBLOCK as u32;
+            }
+            poll.register();
+        });
+    }
 }
 
 impl Future for Listener {
     type Output = Result<TcpStream, ()>;
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> StdPoll<Self::Output> {
-        let fd = self.fd;
-        let token = self.token;
-        let mut peer_addr = libc::sockaddr { sa_data: [0; 14], sa_family: 0 };
-        let mut len = std::mem::size_of::<libc::sockaddr_in>() as _;
-        let socket = unsafe { libc::accept4(fd, &mut peer_addr, &mut len, libc::SOCK_NONBLOCK) };
-        self.poll.reregister(fd, token, libc::EPOLLIN as u32);
-        if socket < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                StdPoll::Pending
-            }else{
-                StdPoll::Ready(Err(()))
-            }
-        }else{
-            StdPoll::Ready(Ok(TcpStream::new(self.poll.clone(), socket, token)))
+        if !self.started {
+            self.setup_poll();
+            self.started = true;
+            return StdPoll::Pending
         }
+        if !self.info.processed {
+            return StdPoll::Pending
+        }
+        if self.info.err != 0 {
+            return StdPoll::Ready(Err(()));
+        }
+        if self.info.n != 0 {
+            return StdPoll::Ready(Ok(TcpStream::new(self.info.n as i32)))
+        }
+        self.accept();
+        self.info.processed = false;
+        StdPoll::Pending
     }
 }
 
@@ -294,14 +357,12 @@ fn str_to_sockaddr(addr: &str) -> Result<libc::sockaddr_in, std::io::Error> {
 }
 
 pub struct TcpListener {
-    poll: Poll,
     fd: i32,
-    sockaddr: libc::sockaddr_in,
-    token: u64
+    sockaddr: libc::sockaddr_in
 }
 
 impl TcpListener {
-    pub fn new(poll: Poll, addr: &str, token: u64) -> Result<Self, std::io::Error> {
+    pub fn new(addr: &str) -> Result<Self, std::io::Error> {
         let fd = unsafe {
             let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
             if fd < 0 {
@@ -310,7 +371,7 @@ impl TcpListener {
             fd
         };
         let sockaddr = str_to_sockaddr(addr)?;
-        Ok(Self { poll, fd, sockaddr, token })
+        Ok(Self { fd, sockaddr })
     }
 
     pub fn reuseaddr(&mut self, val: bool) -> Result<(), std::io::Error> {
@@ -328,47 +389,61 @@ impl TcpListener {
             if result < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            self.poll.register(self.fd, self.token, libc::EPOLLIN as u32);
-            libc::listen(self.fd, 1024);
         }
         Ok(())
     }
 
     pub fn incoming(&mut self) -> Listener {
-        Listener { poll: self.poll.clone(), fd: self.fd, token: self.token }
+        Listener { fd: self.fd, sockaddr: libc::sockaddr { sa_data: [0; 14], sa_family: 0 }, len: std::mem::size_of::<libc::sockaddr>() as u64, info: InfoPtr { processed: false, n: 0, err: 0, buffer: MutVoidPtr(std::ptr::null_mut()) }, started: false }
     }
 }
 
 pub struct Sleep {
-    poll: Poll,
-    token: u64,
     secs: i64,
     nanos: i64,
     started: bool,
-    fd: i32
+    fd: i32,
+    info: InfoPtr
+}
+
+impl Sleep {
+    fn setup_poll(&mut self) {
+        POLL.with(|poll| {
+            let mut poll = poll.lock().unwrap();
+            let timerfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC) };
+            self.fd = timerfd;
+            let spec = libc::itimerspec { it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 }, it_value: { libc::timespec { tv_sec: self.secs, tv_nsec: self.nanos } }  };
+            unsafe { libc::timerfd_settime(timerfd, 0, &spec, core::ptr::null_mut()) };
+            let sqe = poll.get_task();
+            unsafe {
+                (*sqe).fd = timerfd;
+                (*sqe).opcode = IORING_OP_READ;
+                (*sqe).len = std::mem::size_of::<libc::itimerspec>() as u32;
+                (*sqe).user_data = &mut self.info as *mut InfoPtr as u64;
+                (*sqe).addr_u.addr = std::mem::transmute(&spec);
+            }
+            poll.register();
+        });
+    }
 }
 
 impl Future for Sleep {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> StdPoll<Self::Output> {
-        if self.started {
-            let fd = self.fd;
-            self.poll.deregister(fd);
-            return StdPoll::Ready(().into());
+        if !self.started {
+            self.setup_poll();
+            self.started = true;
+            return StdPoll::Pending
         }
-        self.started = true;
-        let timerfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC) };
-        self.fd = timerfd;
-        let spec = libc::itimerspec { it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 }, it_value: { libc::timespec { tv_sec: self.secs, tv_nsec: self.nanos } }  };
-        unsafe { libc::timerfd_settime(timerfd, 0, &spec, core::ptr::null_mut()) };
-        let token = self.token;
-        self.poll.register(timerfd, token, libc::EPOLLIN as u32);
-        StdPoll::Pending
+        if !self.info.processed {
+            return StdPoll::Pending
+        }
+        StdPoll::Ready(().into())
     }
 }
 
-pub fn sleep(poll: Poll, secs: i64, nanos: i64, token: u64) -> Sleep {
-    Sleep { poll, token, secs, nanos, started: false, fd: 0 }
+pub fn i_sleep(secs: i64, nanos: i64) -> Sleep {
+    Sleep { secs, nanos, started: false, fd: 0, info: InfoPtr { processed: false, n: 0, err: 0, buffer: MutVoidPtr(std::ptr::null_mut()) } }
 }
 
 #[derive(Clone)]
@@ -392,164 +467,153 @@ impl Wake for Waker {
     }
 }
 
-type AsyncTask<'a> = Pin<&'a mut dyn Future<Output = ()>>;
+type AsyncTask = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
 
-#[derive(Clone)]
-pub struct Sleeper {
-    poll: Poll,
-    token: u64
+pub fn sleep(duration: std::time::Duration) -> Sleep {
+    let secs_as_nanos = (duration.as_secs() as u128) * (10e8 as u128);
+    let nanos = (duration.as_nanos() - secs_as_nanos) as i64;
+    i_sleep(duration.as_secs() as i64, nanos)
 }
 
-impl Sleeper {
-    pub fn new(poll: Poll, token: u64) -> Self {
-        Self { poll, token }
-    }
-
-    pub fn sleep(&self, duration: std::time::Duration) -> Sleep {
-        let secs_as_nanos = (duration.as_secs() as u128) * (10e8 as u128);
-        let nanos = (duration.as_nanos() - secs_as_nanos) as i64;
-        sleep(self.poll.clone(), duration.as_secs() as i64, nanos, self.token)
-    }
-}
-
-#[derive(Clone)]
-pub struct Utils {
-    poll: Poll,
-    token: u64,
-    sleeper: Sleeper,
-    signal_sender: Sender<u64>,
-}
-
-impl Utils {
-    pub fn new(poll: Poll, token: u64, signal_sender: Sender<u64>) -> Self {
-        Utils { token, signal_sender, poll: poll.clone(), sleeper: Sleeper::new(poll, token) }
-    }
-
-    pub fn sleep(&self, duration: std::time::Duration) -> Sleep {
-        self.sleeper.sleep(duration)
-    }
-
-    pub fn new_tcp_listener(&self, addr: &str) -> Result<TcpListener, std::io::Error> {
-        TcpListener::new(self.poll.clone(), addr, self.token)
-    }
-
-    pub fn open_file<T: ToString>(&self, path: T) -> Result<File, std::io::Error> {
-        File::open(path, libc::O_RDWR, self.token, self.signal_sender.clone())
-    }
-
-    pub fn new_tcp_client(&self, addr: &str) -> SocketConnect {
-        let stream = TcpStream::new_client(self.poll.clone(), addr, self.token).unwrap();
-        SocketConnect { stream, started: false }
-    }
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct InfoPtr {
+    processed: bool,
+    n: u64,
+    err: i32,
+    buffer: uring_lib::MutVoidPtr
 }
 
 #[derive(Clone)]
 pub struct Poll {
-    epfd: i32,
-    count: i32
+    params: uring_lib::io_uring_params,
+    info: uring_lib::uring_queue_info
 }
 
 impl Poll {
     pub fn new() -> Self {
-        let epfd = unsafe { libc::epoll_create(1024) };
-        Self { epfd, count: 0 }
+        let (fd, mut params) = setup_io_uring(1024).unwrap();
+        let info = setup_rings(fd, &mut params).unwrap();
+        Self { params, info }
     }
 
-    pub fn poll(&mut self, events: &mut [libc::epoll_event; 1024]) -> i32 {
-        self.count = unsafe { libc::epoll_wait(self.epfd, events.as_mut_ptr(), 1024, -1) };
-        self.count
+    pub fn poll(&mut self) -> Result<(i32, u64), std::io::Error> {
+        read_cq(&self.params, &self.info, 1)
     }
 
-    pub fn register(&mut self, fd: i32, token: u64, interest: u32) {
-        let mut event = libc::epoll_event { events: interest, u64: token };
-        unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut event); }
+    pub fn register(&mut self) {
+        write_sq(&self.params, &mut self.info).unwrap();
     }
 
-    pub fn reregister(&mut self, fd: i32, token: u64, interest: u32) {
-        let mut event = libc::epoll_event { events: interest, u64: token };
-        unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut event); }
+    pub fn get_task(&mut self) -> *mut uring_lib::io_uring_sqe {
+        uring_lib::get_sqe_tail(&mut self.info)
     }
+}
 
-    pub fn deregister(&mut self, fd: i32) {
-        let mut event = libc::epoll_event { events: 0, u64: 0 };
-        unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut event); }
+thread_local! {
+    pub static TASK_QUEUE : LazyLock<Arc<Mutex<Vec<(u64, AsyncTask)>>>> = LazyLock::new(|| {
+        Arc::new(Mutex::new(Vec::new()))
+    });
+
+    pub static WAKER : LazyLock<std::task::Waker> = LazyLock::new(|| {
+        new_waker()
+    });
+
+    pub static POLL : LazyLock<Arc<Mutex<Poll>>> = LazyLock::new(|| {
+        Arc::new(Mutex::new(Poll::new()))
+    });
+    pub static TASKS : std::sync::LazyLock<Arc<Mutex<HashMap<u64, AsyncTask>>>> = LazyLock::new(|| {
+        Arc::new(Mutex::new(HashMap::new()))
+    });
+    pub static TOKEN : LazyLock<Arc<Mutex<u64>>> = LazyLock::new(|| {
+        Arc::new(Mutex::new(0))
+    });
+}
+
+#[macro_export]
+macro_rules! initialize_runtime {
+    () => {
+        let waker = $crate::WAKER.with(|waker| {
+            (*waker).clone()
+        });
+        let mut runtime = NoirRuntime::new(&waker);
+        runtime.work();
     }
 }
 
 pub struct NoirRuntime<'a> {
     context: Context<'a>,
-    tasks: HashMap<u64, AsyncTask<'a>>,
-    signal_sender: Sender<u64>,
-    signal_receiver: Receiver<u64>,
-    poll: Poll,
-    token: u64,
-    events: [libc::epoll_event; 1024]
 }
 
 impl <'a> NoirRuntime<'a> {
     pub fn new(waker: &'a std::task::Waker) -> Self {
-        let (signal_sender, signal_receiver) = channel();
-        Self { tasks: HashMap::new(), context: Context::from_waker(waker), poll: Poll::new(), token: 0, events: [libc::epoll_event { events: 0, u64: 0 }; 1024], signal_sender, signal_receiver }
-    }
-
-    pub fn get_utils(&mut self) -> Utils {
-        self.token += 1;
-        Utils::new(self.poll.clone(), self.token, self.signal_sender.clone())
-    }
-
-    pub fn task(&mut self, task: AsyncTask<'a>) {
-        self.tasks.insert(self.token, task);
+        Self { context: Context::from_waker(waker) }
     }
 
     pub fn work(&mut self) {
-        self.exec();
-        while !self.tasks.is_empty() {
-            let mut finished = vec![];
-            while let Ok(token) = self.signal_receiver.try_recv() {
-                if self.exec_one(token) {
-                    finished.push(token);
+        let r = self.exec();
+        r.iter().for_each(|x| {
+            TASKS.with(|tasks| {
+                let mut tasks = tasks.lock().unwrap();
+                tasks.remove(x);
+            });
+        });
+        loop {
+            {
+                if TASKS.with(|tasks| {
+                    tasks.lock().unwrap().is_empty()
+                }) {
+                    break
                 }
             }
-            for i in finished.iter() {
-                self.tasks.remove(i);
-            }
-            let event_count = self.poll.poll(&mut self.events);
-            let mut state = 0;
-            for event in self.events {
-                if state == event_count { break; }
-                state += 1;
-                let token = event.u64;
-                if self.exec_one(token) {
-                    finished.push(token);
+            let Ok((ret, ptr)) = POLL.with(|poll| {
+                poll.lock().unwrap().poll()
+            }) else {
+                continue
+            };
+            println!("poll result: {ret} {ptr}");
+
+            let ptr : *mut InfoPtr = std::ptr::with_exposed_provenance_mut(ptr as usize);
+            unsafe {
+                (*ptr).processed = true;
+                if ret < 0 {
+                    (*ptr).err = ret;
+                }else{
+                    (*ptr).n = ret as u64;
                 }
+                println!("{:?}", *ptr);
             }
-            for i in finished {
-                self.tasks.remove(&i);
-            }
+            let finished = self.exec();
+            TASKS.with(|tasks| {
+                let mut t = tasks.lock().unwrap();
+                for i in finished {
+                    t.remove(&i);
+                }
+            });
         }
     }
 
-    pub fn exec_one(&mut self, token: u64) -> bool {
-        let Some(task) = self.tasks.get_mut(&token) else {
-            return false;
-        };
-        match task.as_mut().poll(&mut self.context) {
-            StdPoll::Pending => false,
-            StdPoll::Ready(_) => true
-        }
-    }
-
-    pub fn exec(&mut self) {
+    pub fn exec(&mut self) -> Vec<u64> {
         let mut to_remove = vec![];
-        for (token, task) in self.tasks.iter_mut() {
-            match task.as_mut().poll(&mut self.context) {
-                StdPoll::Pending => (),
-                StdPoll::Ready(_) => {
-                    to_remove.push(*token);
+        TASKS.with(|tasks| {
+            let mut tasks = tasks.lock().unwrap();
+            for (token, task) in tasks.iter_mut() {
+                println!("exec iter");
+                match task.as_mut().poll(&mut self.context) {
+                    StdPoll::Pending => (),
+                    StdPoll::Ready(_) => {
+                        to_remove.push(*token);
+                    }
                 }
             }
-        }
-        to_remove.into_iter().for_each(|x| { self.tasks.remove(&x); });
+            TASK_QUEUE.with(|queue| {
+                let mut queue = queue.lock().unwrap();
+                while let Some((token, task)) = queue.pop() {
+                    tasks.insert(token, task);
+                }
+            });
+        });
+        to_remove
     }
 }
 
@@ -559,15 +623,41 @@ pub fn new_waker() -> std::task::Waker {
 
 #[macro_export]
 macro_rules! push_task {
-    ($runtime:ident, $task:expr) => {
-        let utils = $runtime.get_utils();
-        let pin = pin!($task(utils));
+    ($task:expr) => {
         {
-            $runtime.task(pin);
+            let mut token = $crate::TOKEN.with(|token| {
+                let mut token = token.lock().unwrap();
+                *token += 1;
+                *token
+            });
+            let mut tasks = $crate::TASKS.with(|queue| {
+                let mut queue = queue.lock().unwrap();
+                let pin = Box::pin($task);
+                queue.insert(token, pin);
+            });
         }
     };
-    ($runtime:ident, $task:expr, $($next:expr),*) => {
+    ($task:expr, $($next:expr),*) => {
         push_task!($runtime, $task);
         push_task!($runtime, $($next),*);
+    }
+}
+
+#[macro_export]
+macro_rules! spawn {
+    ($task:expr) => {
+        {
+            let mut token = $crate::TOKEN.with(|token| {
+                let mut token = token.lock().unwrap();
+                *token += 1;
+                *token
+            });
+            let mut tasks = $crate::TASK_QUEUE.with(|queue| {
+                let mut queue = queue.lock().unwrap();
+                println!("SPAWN GOT LOCK");
+                let pin = Box::pin($task);
+                queue.push((token, pin));
+            });
+        }
     }
 }
