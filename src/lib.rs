@@ -1,12 +1,12 @@
-use std::{collections::HashMap, ffi::CString, pin::Pin, sync::{mpsc::{channel, Receiver, Sender}, Arc, LazyLock, Mutex}, task::{Context, Poll as StdPoll, Wake}};
+use std::{collections::HashMap, ffi::CString, pin::Pin, sync::{Arc, LazyLock}, task::{Context, Poll as StdPoll, Wake}};
 use uring_lib::{read_cq, setup_io_uring, setup_rings, write_sq, IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_LISTEN, IORING_OP_READ, IORING_OP_WRITE};
 
 pub trait AsyncRead {
-    fn read(&mut self) -> impl Future<Output = Result<Vec<u8>, std::io::Error>> + Send + Sync;
+    fn read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync;
 }
 
 pub trait AsyncWrite {
-    fn write(&mut self, vec: Vec<u8>) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync;
+    fn write(&mut self, buffer: &[u8]) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync;
 }
 
 pub struct File {
@@ -22,67 +22,32 @@ impl File {
         let fd = unsafe { libc::open(cstr.as_c_str().as_ptr(), flags) };
         Ok(Self { fd })
     }
-}
 
-pub struct FileRead {
-    fd: i32,
-    buffer: Vec<u8>
-}
+    pub fn read<'a>(&self, buffer: &'a mut Vec<u8>) -> FileRead<'a> {
+        FileRead { fd: self.fd, buffer, index: None }
+    }
 
-impl Future for FileRead {
-    type Output = Result<Vec<u8>, std::io::Error>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
-        todo!()
+    pub fn write<'a>(&self, buffer: &'a Vec<u8>) -> FileWrite<'a> {
+        FileWrite { fd: self.fd, buffer, index: None }
     }
 }
 
-pub struct FileWrite {
+pub struct FileRead<'a> {
     fd: i32,
-    token: u64,
-    sender: Sender<u64>,
-    buffer: Vec<u8>
+    buffer: &'a mut Vec<u8>,
+    index: Option<u64>,
 }
 
-impl Future for FileWrite {
-    type Output = Result<usize, std::io::Error>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
-        todo!()
-    }
-}
-
-#[allow(refining_impl_trait)]
-impl AsyncRead for File {
-     fn read(&mut self) -> FdRead {
-         FdRead { fd: self.fd, inner_buffer: Vec::with_capacity(1024), tb: [0; 1024], len: 1024, index: None }
-     }
-}
-
-#[allow(refining_impl_trait)]
-impl AsyncWrite for File {
-    fn write(&mut self, vec: Vec<u8>) -> FdWrite {
-         FdWrite { fd: self.fd, offset: 0, index: None, inner_buffer: Vec::with_capacity(1024) }
-     }
-}
-
-pub struct FdRead {
-    fd: i32,
-    inner_buffer: Vec<u8>,
-    tb: [u8; 1024],
-    len: usize,
-    index: Option<u64>
-}
-
-impl FdRead {
+impl FileRead<'_> {
     fn setup_poll(&mut self) {
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
             let sqe = poll.get_task();
             let fd = self.fd;
-            let len = self.len;
             unsafe {
                 (*sqe).fd = fd;
-                (*sqe).len = len as u32;
-                (*sqe).addr_u.addr = std::mem::transmute(self.tb.as_mut_ptr());
+                (*sqe).len = self.buffer.len() as u32;
+                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_mut_ptr());
                 (*sqe).user_data = self.index.unwrap();
                 (*sqe).opcode = IORING_OP_READ;
                 (*sqe).off_u.off = u64::MAX;
@@ -92,8 +57,117 @@ impl FdRead {
     }
 }
 
-impl Future for FdRead {
-    type Output = Result<Vec<u8>, std::io::Error>;
+impl Future for FileRead<'_> {
+    type Output = Result<usize, std::io::Error>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        if let Some(index) = self.index {
+            let result = SLAB.with(|slab| {
+                slab.borrow().get_result(index)
+            }).unwrap();
+            return if result < 0 {
+                StdPoll::Ready(Err(std::io::Error::from_raw_os_error(result)))
+            }else{
+                StdPoll::Ready(Ok(result as usize))
+            }
+        }
+        let waker = cx.waker().clone();
+        self.index = Some(SLAB.with(|slab| {
+            slab.borrow_mut().add(waker)
+        }));
+        self.setup_poll();
+        StdPoll::Pending
+    }
+}
+
+pub struct FileWrite<'a> {
+    fd: i32,
+    buffer: &'a Vec<u8>,
+    index: Option<u64>
+}
+
+impl FileWrite<'_> {
+    fn setup_poll(&mut self) {
+        let fd = self.fd;
+        POLL.with(|poll| {
+            let mut poll = poll.borrow_mut();
+            let to_write = self.buffer.len();
+            let sqe = poll.get_task();
+            unsafe {
+                (*sqe).fd = fd;
+                (*sqe).len = to_write as u32;
+                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_ptr());
+                (*sqe).opcode = IORING_OP_WRITE;
+                (*sqe).user_data = self.index.unwrap();
+            }
+            poll.register();
+        });
+    }
+}
+
+impl Future for FileWrite<'_> {
+    type Output = Result<usize, std::io::Error>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        if let Some(index) = self.index {
+            let result = SLAB.with(|slab| {
+                slab.borrow().get_result(index)
+            }).unwrap();
+            return if result < 0 {
+                StdPoll::Ready(Err(std::io::Error::from_raw_os_error(result)))
+            }else{
+                StdPoll::Ready(Ok(result as usize))
+            }
+        }
+        let waker = cx.waker().clone();
+        self.index = Some(SLAB.with(|slab| {
+            slab.borrow_mut().add(waker)
+        }));
+        self.setup_poll();
+        StdPoll::Pending
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl AsyncRead for File {
+     fn read<'a>(&mut self, buffer: &'a mut [u8]) -> FdRead<'a> {
+         FdRead { fd: self.fd, buffer, index: None }
+     }
+}
+
+#[allow(refining_impl_trait)]
+impl AsyncWrite for File {
+    fn write<'a>(&mut self, buffer: &'a [u8]) -> FdWrite<'a> {
+         FdWrite { fd: self.fd, index: None, buffer  }
+     }
+}
+
+pub struct FdRead<'a> {
+    fd: i32,
+    buffer: &'a mut [u8],
+    index: Option<u64>
+}
+
+impl FdRead<'_> {
+    fn setup_poll(&mut self) {
+        POLL.with(|poll| {
+            let mut poll = poll.borrow_mut();
+            let sqe = poll.get_task();
+            let fd = self.fd;
+            let len = self.buffer.len();
+            unsafe {
+                (*sqe).fd = fd;
+                (*sqe).len = len as u32;
+                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_mut_ptr());
+                (*sqe).user_data = self.index.unwrap();
+                (*sqe).opcode = IORING_OP_READ;
+                (*sqe).off_u.off = u64::MAX;
+            }
+            poll.register();
+        });
+    }
+}
+
+impl Future for FdRead<'_> {
+    type Output = Result<usize, std::io::Error>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
         if let Some(index) = self.index {
             let result = SLAB.with(|slab| {
@@ -102,9 +176,7 @@ impl Future for FdRead {
             if result < 0 {
                 return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(result as i32)))
             }
-            let tb = self.tb.clone();
-            self.inner_buffer.extend(&tb[..result as usize]);
-            return StdPoll::Ready(Ok(self.inner_buffer.clone()));
+            return StdPoll::Ready(Ok(result as usize));
         }
         let waker = cx.waker().clone();
         self.index = SLAB.with(|slab| {
@@ -166,24 +238,23 @@ impl Future for SocketConnect {
     }
 }
 
-pub struct FdWrite {
+pub struct FdWrite<'a> {
     fd: i32,
-    offset: usize,
     index: Option<u64>,
-    inner_buffer: Vec<u8>
+    buffer: &'a [u8]
 }
 
-impl FdWrite {
+impl FdWrite<'_> {
     fn setup_poll(&mut self) {
         let fd = self.fd;
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
-            let to_write = self.inner_buffer.len() - self.offset;
+            let to_write = self.buffer.len();
             let sqe = poll.get_task();
             unsafe {
                 (*sqe).fd = fd;
                 (*sqe).len = to_write as u32;
-                (*sqe).addr_u.addr = std::mem::transmute(self.inner_buffer.as_mut_ptr().wrapping_add(self.offset));
+                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_ptr());
                 (*sqe).opcode = IORING_OP_WRITE;
                 (*sqe).user_data = self.index.unwrap();
             }
@@ -192,7 +263,7 @@ impl FdWrite {
     }
 }
 
-impl Future for FdWrite {
+impl Future for FdWrite<'_> {
     type Output = Result<usize, std::io::Error>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
         if let Some(index) = self.index {
@@ -203,15 +274,10 @@ impl Future for FdWrite {
             if result < 0 {
                 return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(result as i32)));
             }
-            self.offset += result as usize;
-            if self.offset == self.inner_buffer.len() {
-                return StdPoll::Ready(Ok(self.offset));
-            }
-            self.setup_poll();
-            return StdPoll::Pending;
+            return StdPoll::Ready(Ok(result as usize));
         }
         println!("writing...");
-        if self.inner_buffer.is_empty() { return StdPoll::Ready(Ok(0)); }
+        if self.buffer.is_empty() { return StdPoll::Ready(Ok(0)); }
         let waker = cx.waker().clone();
         self.index = Some(SLAB.with(|slab| {
             slab.borrow_mut().add(waker)
@@ -243,15 +309,15 @@ impl TcpStream {
 
 #[allow(refining_impl_trait)]
 impl AsyncRead for TcpStream {
-    fn read(&mut self) -> FdRead {
-        FdRead { fd: self.fd, index: None, len: 1024, inner_buffer: Vec::new(), tb: [0; 1024] }
+    fn read<'a>(&mut self, buffer: &'a mut[u8]) -> FdRead<'a> {
+        FdRead { fd: self.fd, index: None, buffer }
     }
 }
 
 #[allow(refining_impl_trait)]
 impl AsyncWrite for TcpStream {
-    fn write(&mut self, buffer: Vec<u8>) -> FdWrite {
-        FdWrite { fd: self.fd, offset: 0, index: None, inner_buffer: buffer }
+    fn write<'a>(&mut self, buffer: &'a [u8]) -> FdWrite<'a> {
+        FdWrite { fd: self.fd, index: None, buffer }
     }
 }
 
@@ -498,10 +564,9 @@ impl Timer {
                 (*sqe).off_u.addr2 = std::mem::transmute(&last.timespec);
                 (*sqe).opcode = uring_lib::IORING_OP_TIMEOUT_REMOVE;
                 (*sqe).user_data = self.index;
-                (*sqe).oflags.timeout_flags = uring_lib::IORING_TIMEOUT_UPDATE;
             }
             poll.register();
-        })
+        });
     }
 
     fn next_timer(&mut self) {
@@ -534,12 +599,12 @@ impl Timer {
         });
     }
 
-    fn handle_cancel(&mut self, _res: i32) {
+    fn handle_cancel(&mut self, res: i32) {
+        if res != -libc::ECANCELED && res != -libc::ETIME { return }
         self.setup_timer();
     }
 
-    fn wakeup(&mut self, _res: i32) {
-        println!("WAKEUP");
+    fn wakeup(&mut self, res: i32) {
         let Some(timer_duration) = self.last else {
             return;
         };
@@ -552,7 +617,6 @@ impl Timer {
     }
 
     fn handle_event(&mut self, res: i32) {
-        println!("HANDLE EVENT");
         match self.state {
             TimerState::Idle => return,
             TimerState::Canceling => self.handle_cancel(res),
@@ -569,6 +633,7 @@ impl Timer {
         let timer_duration = TimerDuration::new(secs, nanos, index);
         if let Some(last) = self.last {
             if timer_duration < last {
+                println!("DURATION IS SHORTER GOTTA CANCEL");
                 self.cancel_timer();
                 self.heap.push(last);
                 self.last = Some(timer_duration);
@@ -677,21 +742,27 @@ impl Poll {
 
 pub struct Slab {
     index: u64,
-    wakers: HashMap<u64, std::task::Waker>,
+    cache: Vec<u64>,
+    wakers: Vec<std::task::Waker>,
     results: HashMap<u64, i32>,
     wakers_by_token: HashMap<u64, std::task::Waker>
 }
 
 impl Slab {
     fn new() -> Self {
-        Self { index: 0, wakers: HashMap::new(), results: HashMap::new(), wakers_by_token: HashMap::new() }
+        Self { index: 0, cache: Vec::new(), wakers: Vec::new(), results: HashMap::new(), wakers_by_token: HashMap::new() }
     }
 
     fn add(&mut self, waker: std::task::Waker) -> u64 {
-        let ret = self.index;
-        self.wakers.insert(ret, waker);
-        self.index += 1;
-        ret
+        if let Some(index) = self.cache.pop() {
+            self.wakers[index as usize] = waker;
+            index
+        }else{
+            let ret = self.index;
+            self.wakers.push(waker);
+            self.index += 1;
+            ret
+        }
     }
 
     pub fn add_by_token(&mut self, token: u64, waker: std::task::Waker) {
@@ -703,7 +774,7 @@ impl Slab {
     }
 
     fn get_waker(&self, index: u64) -> Option<&std::task::Waker> {
-        self.wakers.get(&index)
+        self.wakers.get(index as usize)
     }
 
     fn add_result(&mut self, index: u64, result: i32) {
