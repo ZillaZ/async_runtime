@@ -21,6 +21,7 @@ impl PollShutdown {
                 (*sqe).opcode = uring_lib::IORING_OP_SHUTDOWN;
                 (*sqe).fd = self.fd;
                 (*sqe).len = self.how;
+                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
             }
             poll.register();
         });
@@ -46,6 +47,17 @@ impl Future for PollShutdown {
         }));
         self.setup_poll();
         StdPoll::Pending
+    }
+}
+
+impl Drop for PollShutdown {
+    fn drop(&mut self) {
+        let Some(index) = self.index else {
+            return;
+        };
+        let _ = SLAB.try_with(|slab| {
+            slab.borrow_mut().clear_index(index);
+        });
     }
 }
 

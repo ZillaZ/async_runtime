@@ -1,7 +1,7 @@
 use crate::prelude::{AsyncRead, AsyncWrite};
 use crate::reactor::Index;
 use crate::runtime::{POLL, SLAB};
-use crate::descriptors::{FdRead, FdWrite, PollShutdown};
+use crate::descriptors::PollShutdown;
 use uring_lib::{IORING_OP_LISTEN, IORING_OP_ACCEPT, IORING_OP_CONNECT};
 use std::{task::{Context, Poll as StdPoll}, pin::Pin};
 
@@ -153,6 +153,10 @@ impl TcpStream {
         Self { fd }
     }
 
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
     pub fn new_client(addr: &str) -> Result<SocketConnect, std::io::Error> {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
         if fd < 0 {
@@ -165,15 +169,47 @@ impl TcpStream {
 
 #[allow(refining_impl_trait)]
 impl AsyncRead for TcpStream {
-    fn read<'a>(&mut self, buffer: &'a mut[u8]) -> FdRead<'a> {
-        FdRead::new(self.fd, buffer)
+    fn read<'a>(&mut self, buffer: &'a mut[u8]) -> SocketRead<'a> {
+        SocketRead::new(self.fd, buffer, true)
+    }
+
+    fn try_read<'a>(&mut self, buffer: &'a mut [u8]) -> impl Future<Output = Option<Result<usize, std::io::Error>>> + Send + Sync {
+        async {
+            let result = SocketRead::new(self.fd, buffer, false).await;
+            let Err(e) = result else {
+                return Some(result)
+            };
+            let Some(e) = e.raw_os_error() else {
+                return Some(Err(e));
+            };
+            if e == -libc::EAGAIN || e == -libc::EWOULDBLOCK {
+                return None;
+            }
+            return Some(Err(std::io::Error::from_raw_os_error(e)));
+        }
     }
 }
 
 #[allow(refining_impl_trait)]
 impl AsyncWrite for TcpStream {
-    fn write<'a>(&mut self, buffer: &'a [u8]) -> FdWrite<'a> {
-        FdWrite::new(self.fd, buffer)
+    fn write<'a>(&mut self, buffer: &'a [u8]) -> SocketWrite<'a> {
+        SocketWrite::new(self.fd, buffer, true)
+    }
+
+    fn try_write<'a>(&mut self, buffer: &'a [u8]) -> impl Future<Output = Option<Result<usize, std::io::Error>>> + Send + Sync {
+        async {
+            let result = SocketWrite::new(self.fd, buffer, false).await;
+            let Err(e) = result else {
+                return Some(result);
+            };
+            let Some(e) = e.raw_os_error() else {
+                return Some(Err(e));
+            };
+            if e == -libc::EAGAIN || e == -libc::EWOULDBLOCK {
+                return None;
+            }
+            return Some(Err(std::io::Error::from_raw_os_error(e)));
+        }
     }
 
     fn poll_shutdown(&mut self, how: u32) -> PollShutdown {
@@ -229,6 +265,141 @@ impl Future for SocketConnect {
 }
 
 impl Drop for SocketConnect {
+    fn drop(&mut self) {
+        let Some(index) = self.index else {
+            return;
+        };
+        let _ = SLAB.try_with(|slab| {
+            slab.borrow_mut().clear_index(index);
+        });
+    }
+}
+
+pub struct SocketWrite<'a> {
+    fd: i32,
+    index: Option<Index>,
+    buffer: &'a [u8],
+    blocking: bool
+}
+
+impl <'a> SocketWrite<'a> {
+    pub fn new(fd: i32, buffer: &'a [u8], blocking: bool) -> Self {
+        Self { fd, buffer, blocking, index: None }
+    }
+    fn setup_poll(&mut self) {
+        let fd = self.fd;
+        POLL.with(|poll| {
+            let mut poll = poll.borrow_mut();
+            let to_write = self.buffer.len();
+            let sqe = poll.get_task();
+            unsafe {
+                (*sqe).fd = fd;
+                (*sqe).len = to_write as u32;
+                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_ptr());
+                (*sqe).opcode = uring_lib::IORING_OP_SEND;
+                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
+            }
+            poll.register();
+        });
+    }
+}
+
+impl Future for SocketWrite<'_> {
+    type Output = Result<usize, std::io::Error>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        if let Some(index) = self.index {
+            let result = SLAB.with(|slab| {
+                slab.borrow_mut().get_result(index)
+            }).unwrap();
+            if result < 0 {
+                return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(result as i32)));
+            }
+            return StdPoll::Ready(Ok(result as usize));
+        }
+        if self.buffer.is_empty() { return StdPoll::Ready(Ok(0)); }
+        let waker = cx.waker().clone();
+        self.index = Some(SLAB.with(|slab| {
+            slab.borrow_mut().add(waker)
+        }));
+        self.setup_poll();
+        return StdPoll::Pending;
+    }
+}
+
+impl Drop for SocketWrite<'_> {
+    fn drop(&mut self) {
+        let Some(index) = self.index else {
+            return;
+        };
+        let _ = SLAB.try_with(|slab| {
+            slab.borrow_mut().clear_index(index);
+        });
+    }
+}
+
+pub struct SocketRead<'a> {
+    fd: i32,
+    buffer: &'a mut [u8],
+    index: Option<Index>,
+    blocking: bool
+}
+
+impl <'a> SocketRead<'a> {
+    pub fn new(fd: i32, buffer: &'a mut [u8], blocking: bool) -> Self {
+        Self { fd, buffer, blocking, index: None }
+    }
+
+    fn setup_poll(&mut self) {
+        POLL.with(|poll| {
+            let mut poll = poll.borrow_mut();
+            let sqe = poll.get_task();
+            let fd = self.fd;
+            let buf_ptr = self.buffer.as_mut_ptr();
+            let buf_len = self.buffer.len();
+            let user_data = self.index.unwrap();
+            unsafe {
+                (*sqe).fd = fd;
+                (*sqe).opcode = uring_lib::IORING_OP_RECV;
+                (*sqe).addr_u.addr = buf_ptr as u64;
+                (*sqe).len = buf_len as u32;
+                if !self.blocking {
+                    (*sqe).oflags.msg_flags = libc::MSG_DONTWAIT as u32;
+                }
+                (*sqe).off_u.off = 0;
+                (*sqe).user_data = std::mem::transmute(user_data);
+            }
+            println!("sqe registered");
+            poll.register();
+        });
+    }
+}
+
+impl Future for SocketRead<'_> {
+    type Output = Result<usize, std::io::Error>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
+        if let Some(index) = self.index {
+            let result = SLAB.with(|slab| {
+                slab.borrow_mut().get_result(index)
+            }).unwrap();
+            println!("result is {result}");
+            if result < 0 {
+                if result == -libc::EWOULDBLOCK || result == -libc::EAGAIN {
+                    return StdPoll::Ready(Ok(0));
+                }
+                return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(result as i32)))
+            }
+            return StdPoll::Ready(Ok(result as usize));
+        }
+        let waker = cx.waker().clone();
+        self.index = SLAB.with(|slab| {
+            Some(slab.borrow_mut().add(waker))
+        });
+        self.setup_poll();
+        return StdPoll::Pending;
+    }
+}
+
+impl Drop for SocketRead<'_> {
     fn drop(&mut self) {
         let Some(index) = self.index else {
             return;
