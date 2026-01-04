@@ -21,10 +21,15 @@ impl <T> AsyncBufRead for BufReader<T> where T: Sized + AsyncRead + Send + Sync 
     fn fill_buf(&mut self) -> impl Future<Output = Result<&[u8], std::io::Error>> + Send + Sync {
         async {
             let mut buffer : &mut [u8] = &mut [0; 1024];
-            let Some(bytes) = self.try_read(&mut buffer).await else {
-                return Ok(&self.buffer[self.offset..]);
+            let bytes = if self.offset == 0 {
+                self.read(&mut buffer).await?
+            }else{
+                let result = self.try_read(&mut buffer).await;
+                if result.is_none() {
+                    return Ok(&self.buffer[self.offset..]);
+                }
+                result.unwrap()?
             };
-            let bytes = bytes?;
             self.buffer.extend(&buffer[..bytes]);
             Ok(&self.buffer[self.offset..])
         }

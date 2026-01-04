@@ -1,6 +1,7 @@
 use std::{pin::Pin, rc::Rc, cell::RefCell, sync::{Arc, LazyLock}, collections::HashMap, task::{Context, Wake, Poll as StdPoll}};
-use crate::reactor::{Poll, Slab, TokenManager};
+use crate::reactor::{Slab, TokenManager};
 use crate::time::Timer;
+use io_uring::IoUring;
 
 thread_local! {
     pub static TASK_QUEUE : LazyLock<Rc<RefCell<Vec<(u64, AsyncTask)>>>> = LazyLock::new(|| {
@@ -12,8 +13,8 @@ thread_local! {
     pub static SLAB : LazyLock<Rc<RefCell<Slab>>> = LazyLock::new(|| {
         Rc::new(RefCell::new(Slab::new()))
     });
-    pub static POLL : LazyLock<Rc<RefCell<Poll>>> = LazyLock::new(|| {
-        Rc::new(RefCell::new(Poll::new()))
+    pub static POLL : LazyLock<Rc<RefCell<IoUring>>> = LazyLock::new(|| {
+        Rc::new(RefCell::new(IoUring::new(1024).unwrap()))
     });
     pub static TASKS : std::sync::LazyLock<Rc<RefCell<HashMap<u64, AsyncTask>>>> = LazyLock::new(|| {
         Rc::new(RefCell::new(HashMap::new()))
@@ -49,24 +50,25 @@ impl <'a> NoirRuntime<'a> {
         loop {
             self.drain_queue();
             self.drain_completion();
-            let Ok((ret, idx)) = POLL.with(|poll| {
-                poll.borrow_mut().poll()
+            let Some(result) = POLL.with(|poll| {
+                poll.borrow_mut().submit_and_wait(1).unwrap();
+                poll.borrow_mut().completion().next()
             }) else {
                 continue
             };
             let is_timer = TIMER.with(|timer| {
                 let mut timer = timer.borrow_mut();
-                if !timer.is_timer(idx) { return false };
-                timer.handle_event(ret);
+                if !timer.is_timer(result.user_data()) { return false };
+                timer.handle_event(result.result(), result.user_data());
                 true
             });
             if is_timer {
                 continue;
             }
             SLAB.with(|slab| {
-                let idx = unsafe { std::mem::transmute(idx) };
+                let idx = unsafe { std::mem::transmute(result.user_data()) };
                 let mut slab = slab.borrow_mut();
-                slab.add_result(idx, ret.into());
+                slab.add_result(idx, result.result());
                 let waker = slab.get_waker(idx).unwrap();
                 waker.wake_by_ref();
             });

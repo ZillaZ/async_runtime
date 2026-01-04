@@ -1,3 +1,5 @@
+use io_uring::{opcode::Timeout, types::{TimeoutFlags, Timespec}};
+
 use crate::reactor::Index;
 use std::{task::{Context, Poll as StdPoll}, sync::Arc, pin::Pin};
 use crate::runtime::{TIMER, SLAB, POLL, Waker};
@@ -45,41 +47,61 @@ impl Drop for Sleep {
 }
 
 use std::collections::BinaryHeap;
+use std::cmp::Reverse;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct TimerDuration {
     secs: i64,
     nanos: i64,
-    index: Index,
-    timespec: libc::timespec
+    task_index: Index,
+    timer_index: Index
 }
 
+impl TimerDuration {
+    fn new(secs: i64, nanos: i64, task_index: Index, timer_index: Index) -> Self {
+        TimerDuration { secs, nanos, task_index, timer_index }
+    }
+
+    fn to_timespec(&self) -> Timespec {
+        Timespec::new().sec(self.secs as u64).nsec(self.nanos as u32)
+    }
+
+    // Create from current time + duration
+    fn from_duration(duration: std::time::Duration, task_index: Index, timer_index: Index) -> Self {
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+        }
+
+        let duration_secs = duration.as_secs() as i64;
+        let duration_nanos = (duration.as_nanos() % 1_000_000_000) as i64;
+
+        // Add duration to current time with proper carry handling
+        let mut total_nanos = now.tv_nsec + duration_nanos;
+        let mut total_secs = now.tv_sec + duration_secs;
+
+        if total_nanos >= 1_000_000_000 {
+            total_secs += total_nanos / 1_000_000_000;
+            total_nanos %= 1_000_000_000;
+        }
+
+        TimerDuration::new(total_secs, total_nanos, task_index, timer_index)
+    }
+}
+
+// Natural ordering: earlier times are less than later times
 impl PartialOrd for TimerDuration {
-    fn ge(&self, other: &Self) -> bool {
-        let (secs, nanos) = ((self.secs - other.secs), (self.nanos - other.nanos));
-        secs >= 0 || (secs == 0 && nanos >= 0)
-    }
-    fn gt(&self, other: &Self) -> bool {
-        let (secs, nanos) = ((self.secs - other.secs), (self.nanos - other.nanos));
-        secs > 0 || (secs == 0 && nanos > 0)
-    }
-    fn le(&self, other: &Self) -> bool {
-        let (secs, nanos) = ((self.secs - other.secs), (self.nanos - other.nanos));
-        secs <= 0 || (secs == 0 && nanos <= 0)
-    }
-    fn lt(&self, other: &Self) -> bool {
-        let (secs, nanos) = ((self.secs - other.secs), (self.nanos - other.nanos));
-        secs < 0 || (secs == 0 && nanos < 0)
-    }
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if self.gt(other) {
-            Some(std::cmp::Ordering::Greater)
-        }else if self.lt(other){
-            Some(std::cmp::Ordering::Less)
-        }else if self.eq(other) {
-            Some(std::cmp::Ordering::Equal)
-        }else{
-            None
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerDuration {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Compare seconds first, then nanoseconds
+        match self.secs.cmp(&other.secs) {
+            std::cmp::Ordering::Equal => self.nanos.cmp(&other.nanos),
+            ord => ord,
         }
     }
 }
@@ -90,33 +112,9 @@ impl PartialEq for TimerDuration {
     fn eq(&self, other: &Self) -> bool {
         self.secs == other.secs && self.nanos == other.nanos
     }
-
-    fn ne(&self, other: &Self) -> bool {
-        !self.eq(other)
-    }
 }
 
-impl TimerDuration {
-    fn new(secs: i64, nanos: i64, index: Index) -> Self {
-        let timespec = libc::timespec { tv_sec: secs, tv_nsec: nanos };
-        TimerDuration { secs, nanos, index, timespec }
-    }
-}
-
-impl Ord for TimerDuration {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if (self.secs, self.nanos) == (other.secs, other.nanos) {
-            return std::cmp::Ordering::Equal;
-        }
-        let sub = ((self.secs - other.secs), (self.nanos - other.nanos));
-        if sub.0 <= 0 && sub.1 < 0 {
-            std::cmp::Ordering::Greater
-        }else{
-            std::cmp::Ordering::Less
-        }
-    }
-}
-
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum TimerState {
     Idle,
     Waiting,
@@ -124,126 +122,181 @@ enum TimerState {
 }
 
 pub struct Timer {
-    fd: i32,
-    heap: BinaryHeap<TimerDuration>,
-    last: Option<TimerDuration>,
+    heap: BinaryHeap<Reverse<TimerDuration>>,  // Min-heap using Reverse
+    active_timer: Option<TimerDuration>,
+    active_timespec: Timespec,
     index: Index,
-    state: TimerState
+    state: TimerState,
 }
 
 impl Timer {
     pub fn new() -> Self {
-        let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC) };
         let index = SLAB.with(|slab| {
             let waker = std::task::Waker::from(Arc::new(Waker::new(0)));
             slab.borrow_mut().add(waker)
         });
-        Self { fd, index, heap: BinaryHeap::new(), last: None, state: TimerState::Idle }
+        Self {
+            index,
+            heap: BinaryHeap::new(),
+            active_timer: None,
+            active_timespec: Timespec::new(),
+            state: TimerState::Idle
+        }
     }
 
     pub fn is_timer(&self, index: u64) -> bool {
-        self.index.index as u64 == index
+        let index = unsafe { std::mem::transmute::<u64, Index>(index) };
+        self.index.index == index.index
     }
 
-    fn cancel_timer(&mut self) {
-        let Some(last) = self.last else {
+    fn cancel_current_timer(&mut self) {
+        let Some(timer) = self.active_timer else {
             return;
         };
+
+        println!("Canceling timer: {:?}", timer);
         self.state = TimerState::Canceling;
+
         POLL.with(|poll| {
-            let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
             unsafe {
-                (*sqe).addr_u.addr = std::mem::transmute(self.index);
-                (*sqe).off_u.addr2 = std::mem::transmute(&last.timespec);
-                (*sqe).opcode = uring_lib::IORING_OP_TIMEOUT_REMOVE;
-                (*sqe).user_data = std::mem::transmute(self.index);
+                let entry = io_uring::opcode::TimeoutRemove::new(std::mem::transmute(timer.timer_index))
+                    .build()
+                    .user_data(std::mem::transmute(timer.timer_index));
+                poll.borrow_mut().submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 
-    fn next_timer(&mut self) {
-        let Some(timer_duration) = self.heap.pop() else {
+    fn start_next_timer(&mut self) {
+        // Pop the earliest timer from the heap
+        let Some(Reverse(timer_duration)) = self.heap.pop() else {
+            println!("No more timers in heap, going idle");
             self.state = TimerState::Idle;
-            self.last = None;
+            self.active_timer = None;
+            self.active_timespec = Timespec::new();
             return;
         };
-        self.last = Some(timer_duration);
-        self.setup_timer();
+
+        println!("Starting next timer: {:?}", timer_duration);
+        self.active_timer = Some(timer_duration);
+        self.submit_timer(timer_duration);
     }
 
-    fn setup_timer(&mut self) {
-        let Some(timer_duration) = self.last else {
-            return;
-        };
+    fn submit_timer(&mut self, timer: TimerDuration) {
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
             unsafe {
-                (*sqe).fd = self.fd;
-                (*sqe).opcode = uring_lib::IORING_OP_TIMEOUT;
-                (*sqe).len = 1;
-                (*sqe).user_data = std::mem::transmute(self.index);
-                (*sqe).addr_u.addr = std::mem::transmute(&timer_duration.timespec);
-                (*sqe).oflags.timeout_flags = uring_lib::IORING_TIMEOUT_ABS;
+                let timespec = timer.to_timespec();
+                self.active_timespec = timespec;
+                let entry = io_uring::opcode::Timeout::new(&self.active_timespec as _)
+                    .flags(TimeoutFlags::ABS)
+                    .build()
+                    .user_data(std::mem::transmute(timer.timer_index));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
-            self.state = TimerState::Waiting;
         });
+        self.state = TimerState::Waiting;
     }
 
-    fn handle_cancel(&mut self, res: i32) {
-        if res != -libc::ECANCELED && res != -libc::ETIME { return }
-        self.setup_timer();
+    fn handle_cancel_completion(&mut self, res: i32) {
+        println!("Cancel completed with result: {}", res);
+
+        match -res {
+            0 | libc::ENOENT => {
+                return
+            }
+            libc::ECANCELED => {
+                let Some(timer) = self.active_timer else {
+                    return;
+                };
+                self.heap.push(Reverse(timer));
+                self.start_next_timer();
+            }
+            libc::ETIME => {
+                self.handle_timeout_completion(res);
+            }
+            _ => {
+                unreachable!()
+            }
+        }
     }
 
-    fn wakeup(&mut self, res: i32) {
-        if res != -libc::ETIME { return }
-        let Some(timer_duration) = self.last else {
+    fn handle_timeout_completion(&mut self, res: i32) {
+        println!("Timeout completed with result: {}", res);
+
+        if res != -libc::ETIME {
+            println!("Unexpected timeout result: {}", res);
+            return;
+        }
+
+        let Some(timer) = self.active_timer else {
+            println!("Timeout fired but no active timer!");
             return;
         };
+
+        // Wake the task associated with this timer
         SLAB.with(|slab| {
             let slab = slab.borrow();
-            let waker = slab.get_waker(timer_duration.index).unwrap();
-            waker.wake_by_ref();
-        });
-        self.next_timer();
-    }
-
-    pub fn handle_event(&mut self, res: i32) {
-        match self.state {
-            TimerState::Idle => return,
-            TimerState::Canceling => self.handle_cancel(res),
-            TimerState::Waiting => self.wakeup(res),
-        }
-    }
-
-    pub fn add_duration(&mut self, duration: std::time::Duration, index: Index) {
-        let (secs, nanos) = duration_to_secs_nanos(duration);
-        let mut timespec = libc::timespec { tv_sec: secs, tv_nsec: nanos };
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, std::mem::transmute(&mut timespec)); }
-        let (secs, nanos) = (secs + timespec.tv_sec, nanos + timespec.tv_nsec);
-        let timer_duration = TimerDuration::new(secs, nanos, index);
-        if let Some(last) = self.last {
-            if timer_duration < last {
-                self.cancel_timer();
-                self.heap.push(last);
-                self.last = Some(timer_duration);
-            }else{
-                self.heap.push(timer_duration);
+            if let Some(waker) = slab.get_waker(timer.task_index) {
+                println!("Waking task for index: {:?}", timer.task_index);
+                waker.wake_by_ref();
+            } else {
+                println!("No waker found for index: {:?}", timer.task_index);
             }
-        }else {
-            self.last = Some(timer_duration);
-            self.setup_timer();
+        });
+
+        // Start the next timer
+        self.start_next_timer();
+    }
+
+    pub fn handle_event(&mut self, res: i32, index: u64) {
+        println!("Timer event - state: {:?}, result: {}", self.state, res);
+        if let Some(timer) = self.active_timer {
+            let index = unsafe { std::mem::transmute::<u64, Index>(index) };
+            let l = index.generation;
+            let r = timer.timer_index.generation;
+            println!("Got event with generation {l}. Our active timer has generation {r}");
+        }
+
+        match self.state {
+            TimerState::Idle => {
+                println!("Event received while idle - ignoring");
+            },
+            TimerState::Canceling => {
+                self.handle_cancel_completion(res);
+            },
+            TimerState::Waiting => {
+                self.handle_timeout_completion(res);
+            },
         }
     }
-}
 
-fn duration_to_secs_nanos(duration: std::time::Duration) -> (i64, i64) {
-    let secs_as_nanos = (duration.as_secs() as u128) * (10e8 as u128);
-    let nanos = (duration.as_nanos() - secs_as_nanos) as i64;
-    (duration.as_secs() as i64, nanos)
+    pub fn add_duration(&mut self, duration: std::time::Duration, task_index: Index) {
+        self.index.generation = self.index.generation.wrapping_add(1);
+        let new_timer = TimerDuration::from_duration(duration, task_index, self.index);
+        println!("Adding timer: {:?}, current state: {:?}", new_timer, self.state);
+
+        match self.state {
+            TimerState::Idle => {
+                // No active timer, start this one immediately
+                self.active_timer = Some(new_timer);
+                self.submit_timer(new_timer);
+            }
+            TimerState::Waiting => {
+                let active = self.active_timer.unwrap();
+                self.heap.push(Reverse(new_timer));
+                if new_timer < active {
+                    println!("New timer {:?} is earlier than active {:?}, canceling current timer", new_timer, active);
+                    self.cancel_current_timer();
+                }
+            }
+            TimerState::Canceling => {
+                // Currently canceling - add to heap, it will be handled after cancel completes
+                println!("Currently canceling, adding to heap");
+                self.heap.push(Reverse(new_timer));
+            }
+        }
+    }
 }
 
 pub fn sleep(duration: std::time::Duration) -> Sleep {

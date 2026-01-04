@@ -1,7 +1,8 @@
-use uring_lib::{IORING_OP_READ, IORING_OP_WRITE};
 use crate::reactor::Index;
 use crate::runtime::{SLAB, POLL};
 use std::{task::{Context, Poll as StdPoll}, pin::Pin};
+use io_uring::types::Fd;
+use io_uring::opcode::{Read, Write, Shutdown};
 
 pub struct PollShutdown {
     fd: i32,
@@ -16,14 +17,12 @@ impl PollShutdown {
     fn setup_poll(&mut self) {
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
             unsafe {
-                (*sqe).opcode = uring_lib::IORING_OP_SHUTDOWN;
-                (*sqe).fd = self.fd;
-                (*sqe).len = self.how;
-                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
+                let entry = Shutdown::new(Fd(self.fd), self.how as i32)
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 }
@@ -72,19 +71,15 @@ impl <'a> FdWrite<'a> {
         Self { fd, buffer, index: None }
     }
     fn setup_poll(&mut self) {
-        let fd = self.fd;
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
             let to_write = self.buffer.len();
-            let sqe = poll.get_task();
             unsafe {
-                (*sqe).fd = fd;
-                (*sqe).len = to_write as u32;
-                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_ptr());
-                (*sqe).opcode = IORING_OP_WRITE;
-                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
+                let entry = Write::new(Fd(self.fd), self.buffer.as_ptr() as _, to_write as _)
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 }
@@ -135,18 +130,12 @@ impl <'a> FdRead<'a> {
     fn setup_poll(&mut self) {
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
-            let fd = self.fd;
-            let len = self.buffer.len();
             unsafe {
-                (*sqe).fd = fd;
-                (*sqe).len = len as u32;
-                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_mut_ptr());
-                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
-                (*sqe).opcode = IORING_OP_READ;
-                (*sqe).off_u.off = u64::MAX;
+                let entry = Read::new(Fd(self.fd), self.buffer.as_mut_ptr() as _, self.buffer.len() as _)
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 }

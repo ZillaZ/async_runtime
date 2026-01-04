@@ -24,11 +24,10 @@ impl TokenManager {
 }
 
 use std::collections::HashMap;
-use uring_lib::{read_cq, write_sq, setup_rings, setup_io_uring};
 
 #[repr(C)]
 #[repr(packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Index {
     pub index: u32,
     pub generation: u32
@@ -115,31 +114,5 @@ impl Slab {
 
     pub fn clear_token(&mut self, token: u64) {
         self.wakers_by_token.remove(&token);
-    }
-}
-
-#[derive(Clone)]
-pub struct Poll {
-    params: uring_lib::io_uring_params,
-    info: uring_lib::uring_queue_info
-}
-
-impl Poll {
-    pub fn new() -> Self {
-        let (fd, mut params) = setup_io_uring(1024).unwrap();
-        let info = setup_rings(fd, &mut params).unwrap();
-        Self { params, info }
-    }
-
-    pub fn poll(&mut self) -> Result<(i32, u64), std::io::Error> {
-        read_cq(&self.params, &self.info, 1)
-    }
-
-    pub fn register(&mut self) {
-        write_sq(&self.params, &mut self.info).unwrap();
-    }
-
-    pub fn get_task(&mut self) -> *mut uring_lib::io_uring_sqe {
-        uring_lib::get_sqe_tail(&mut self.info)
     }
 }

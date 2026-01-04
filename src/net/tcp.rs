@@ -2,8 +2,9 @@ use crate::prelude::{AsyncRead, AsyncWrite};
 use crate::reactor::Index;
 use crate::runtime::{POLL, SLAB};
 use crate::descriptors::PollShutdown;
-use uring_lib::{IORING_OP_LISTEN, IORING_OP_ACCEPT, IORING_OP_CONNECT};
 use std::{task::{Context, Poll as StdPoll}, pin::Pin};
+use io_uring::types::Fd;
+use io_uring::opcode::{Accept, Connect, Listen, Recv, Send as ISend};
 
 pub struct Listener {
     fd: i32,
@@ -14,36 +15,27 @@ pub struct Listener {
 
 impl Listener {
     fn setup_poll(&mut self) {
-        let fd = self.fd;
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
             unsafe {
-                (*sqe).opcode = IORING_OP_LISTEN;
-                (*sqe).len = 0;
-                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
-                (*sqe).fd = fd;
+                let entry = Listen::new(Fd(self.fd), 0)
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 
     fn accept(&mut self) {
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
-            let fd = self.fd;
             unsafe {
-                let len = std::mem::transmute(&mut self.len);
-                (*sqe).opcode = IORING_OP_ACCEPT;
-                (*sqe).len = 0;
-                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
-                (*sqe).off_u.addr2 = len;
-                (*sqe).addr_u.addr = std::mem::transmute(&mut self.sockaddr);
-                (*sqe).fd = fd;
-                (*sqe).oflags.accept_flags = libc::SOCK_NONBLOCK as u32;
+                let entry = Accept::new(Fd(self.fd), &mut self.sockaddr as _, std::mem::transmute(&mut self.len))
+                    .flags(libc::SOCK_NONBLOCK)
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 }
@@ -226,19 +218,14 @@ pub struct SocketConnect {
 
 impl SocketConnect {
     fn setup_poll(&mut self) {
-        let fd = self.stream.fd;
         POLL.with(|poll| {
-           let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
+            let mut poll = poll.borrow_mut();
             unsafe {
-                (*sqe).fd = fd;
-                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
-                (*sqe).opcode = IORING_OP_CONNECT;
-                (*sqe).len = 0;
-                (*sqe).addr_u.addr = std::mem::transmute(&mut self.sockaddr);
-                (*sqe).off_u.off = self.len as u64;
+                let entry = Connect::new(Fd(self.stream.fd), std::mem::transmute(&mut self.sockaddr), self.len as _)
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 }
@@ -287,19 +274,16 @@ impl <'a> SocketWrite<'a> {
         Self { fd, buffer, blocking, index: None }
     }
     fn setup_poll(&mut self) {
-        let fd = self.fd;
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
             let to_write = self.buffer.len();
-            let sqe = poll.get_task();
             unsafe {
-                (*sqe).fd = fd;
-                (*sqe).len = to_write as u32;
-                (*sqe).addr_u.addr = std::mem::transmute(self.buffer.as_ptr());
-                (*sqe).opcode = uring_lib::IORING_OP_SEND;
-                (*sqe).user_data = std::mem::transmute(self.index.unwrap());
+                let entry = ISend::new(Fd(self.fd), self.buffer.as_ptr() as _, to_write as _)
+                    .flags(if !self.blocking { libc::MSG_DONTWAIT } else { 0 })
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            poll.register();
         });
     }
 }
@@ -352,24 +336,13 @@ impl <'a> SocketRead<'a> {
     fn setup_poll(&mut self) {
         POLL.with(|poll| {
             let mut poll = poll.borrow_mut();
-            let sqe = poll.get_task();
-            let fd = self.fd;
-            let buf_ptr = self.buffer.as_mut_ptr();
-            let buf_len = self.buffer.len();
-            let user_data = self.index.unwrap();
             unsafe {
-                (*sqe).fd = fd;
-                (*sqe).opcode = uring_lib::IORING_OP_RECV;
-                (*sqe).addr_u.addr = buf_ptr as u64;
-                (*sqe).len = buf_len as u32;
-                if !self.blocking {
-                    (*sqe).oflags.msg_flags = libc::MSG_DONTWAIT as u32;
-                }
-                (*sqe).off_u.off = 0;
-                (*sqe).user_data = std::mem::transmute(user_data);
+                let entry = Recv::new(io_uring::types::Fd(self.fd), self.buffer.as_mut_ptr() as _, self.buffer.len() as _)
+                    .flags(if !self.blocking { libc::MSG_DONTWAIT } else { 0 })
+                    .build()
+                    .user_data(std::mem::transmute(self.index.unwrap()));
+                poll.submission().push(&entry).unwrap();
             }
-            println!("sqe registered");
-            poll.register();
         });
     }
 }
@@ -383,9 +356,6 @@ impl Future for SocketRead<'_> {
             }).unwrap();
             println!("result is {result}");
             if result < 0 {
-                if result == -libc::EWOULDBLOCK || result == -libc::EAGAIN {
-                    return StdPoll::Ready(Ok(0));
-                }
                 return StdPoll::Ready(Err(std::io::Error::from_raw_os_error(result as i32)))
             }
             return StdPoll::Ready(Ok(result as usize));

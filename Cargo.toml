@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 flume = "*"
 libc = "*"
-uring_lib = { path = "../uring_lib" }
+io-uring = "*"

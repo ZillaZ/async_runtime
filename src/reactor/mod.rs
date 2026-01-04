@@ -1,3 +1,3 @@
 mod slab;
 
-pub use slab::{Index, Slab, Poll, TokenManager};
+pub use slab::{Index, Slab, TokenManager};
