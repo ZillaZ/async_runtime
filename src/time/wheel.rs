@@ -1,50 +1,9 @@
-use io_uring::{opcode::Timeout, types::{TimeoutFlags, Timespec}};
+use io_uring::{opcode::Timeout as ITimeout, squeue::Flags, types::{TimeoutFlags, Timespec}};
 
 use crate::reactor::Index;
 use std::{task::{Context, Poll as StdPoll}, sync::Arc, pin::Pin};
-use crate::runtime::{TIMER, SLAB, POLL, Waker};
-
-pub struct Sleep {
-    duration: std::time::Duration,
-    index: Option<Index>
-}
-
-impl Sleep {
-    fn setup_poll(&mut self) {
-        TIMER.with(|timer| {
-            let mut timer = timer.borrow_mut();
-            unsafe {
-                timer.add_duration(self.duration, std::mem::transmute(self.index.unwrap()));
-            }
-        });
-    }
-}
-
-impl Future for Sleep {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> StdPoll<Self::Output> {
-        if self.index.is_some() {
-            return StdPoll::Ready(().into());
-        }
-        let waker = cx.waker().clone();
-        self.index = Some(SLAB.with(|slab| {
-            slab.borrow_mut().add(waker)
-        }));
-        self.setup_poll();
-        return StdPoll::Pending
-    }
-}
-
-impl Drop for Sleep {
-    fn drop(&mut self) {
-        let Some(index) = self.index else {
-            return;
-        };
-        let _ = SLAB.try_with(|slab| {
-            slab.borrow_mut().clear_index(index);
-        });
-    }
-}
+use crate::runtime::{SLAB, POLL, Waker};
+use crate::io_uring::api::{Timeout, LinkedTimeout};
 
 use std::collections::BinaryHeap;
 use std::cmp::Reverse;
@@ -54,12 +13,14 @@ struct TimerDuration {
     secs: i64,
     nanos: i64,
     task_index: Index,
-    timer_index: Index
+    timer_index: Index,
+    flags: Option<Flags>,
+    linked: bool
 }
 
 impl TimerDuration {
-    fn new(secs: i64, nanos: i64, task_index: Index, timer_index: Index) -> Self {
-        TimerDuration { secs, nanos, task_index, timer_index }
+    fn new(secs: i64, nanos: i64, task_index: Index, timer_index: Index, flags: Option<Flags>, linked: bool) -> Self {
+        TimerDuration { secs, nanos, task_index, timer_index, flags, linked }
     }
 
     fn to_timespec(&self) -> Timespec {
@@ -67,7 +28,7 @@ impl TimerDuration {
     }
 
     // Create from current time + duration
-    fn from_duration(duration: std::time::Duration, task_index: Index, timer_index: Index) -> Self {
+    fn from_duration(duration: std::time::Duration, task_index: Index, timer_index: Index, flags: Option<Flags>, linked: bool) -> Self {
         let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe {
             libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
@@ -85,7 +46,7 @@ impl TimerDuration {
             total_nanos %= 1_000_000_000;
         }
 
-        TimerDuration::new(total_secs, total_nanos, task_index, timer_index)
+        TimerDuration::new(total_secs, total_nanos, task_index, timer_index, flags, linked)
     }
 }
 
@@ -188,10 +149,19 @@ impl Timer {
             unsafe {
                 let timespec = timer.to_timespec();
                 self.active_timespec = timespec;
-                let entry = io_uring::opcode::Timeout::new(&self.active_timespec as _)
-                    .flags(TimeoutFlags::ABS)
-                    .build()
-                    .user_data(std::mem::transmute(timer.timer_index));
+                let mut entry = if timer.linked {
+                    io_uring::opcode::LinkTimeout::new(&self.active_timespec as _)
+                        .build()
+                        .user_data(std::mem::transmute(timer.timer_index))
+                }else{
+                    ITimeout::new(&self.active_timespec as _)
+                        .flags(TimeoutFlags::ABS)
+                        .build()
+                        .user_data(std::mem::transmute(timer.timer_index))
+                };
+                if let Some(flags) = timer.flags {
+                    entry = entry.flags(flags);
+                }
                 poll.submission().push(&entry).unwrap();
             }
         });
@@ -271,9 +241,9 @@ impl Timer {
         }
     }
 
-    pub fn add_duration(&mut self, duration: std::time::Duration, task_index: Index) {
+    pub fn add_duration(&mut self, duration: std::time::Duration, task_index: Index, flags: Option<Flags>, linked: bool) {
         self.index.generation = self.index.generation.wrapping_add(1);
-        let new_timer = TimerDuration::from_duration(duration, task_index, self.index);
+        let new_timer = TimerDuration::from_duration(duration, task_index, self.index, flags, linked);
         println!("Adding timer: {:?}, current state: {:?}", new_timer, self.state);
 
         match self.state {
@@ -299,6 +269,10 @@ impl Timer {
     }
 }
 
-pub fn sleep(duration: std::time::Duration) -> Sleep {
-    Sleep { duration, index: None }
+pub fn sleep(duration: std::time::Duration) -> Timeout {
+    Timeout::new(duration)
+}
+
+pub fn linked_timeout(duration: std::time::Duration) -> LinkedTimeout {
+    LinkedTimeout::new(duration)
 }

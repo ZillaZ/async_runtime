@@ -33,6 +33,12 @@ pub struct Index {
     pub generation: u32
 }
 
+impl Index {
+    pub fn num(&self) -> u64 {
+        unsafe { std::mem::transmute(*self) }
+    }
+}
+
 pub struct Slab {
     index: u32,
     cache: Vec<Index>,

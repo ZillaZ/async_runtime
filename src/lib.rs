@@ -5,6 +5,7 @@ pub mod net;
 pub mod fs;
 pub mod time;
 pub mod io;
+mod io_uring;
 
 #[macro_use]
 mod macros;
@@ -19,4 +20,5 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::runtime::{TOKEN_MANAGER, TASK_QUEUE, TASKS};
+    pub use io_uring::squeue::Flags;
 }

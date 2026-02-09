@@ -30,3 +30,16 @@ macro_rules! spawn {
         }
     }
 }
+
+#[macro_export]
+macro_rules! timeout {
+    ($task:expr, $duration:expr) => {
+        {
+            use $crate::time::linked_timeout;
+            use $crate::__private::Flags;
+            $task.flags(Flags::IO_LINK);
+            linked_timeout($duration).await;
+            $task.await
+        }
+    }
+}

@@ -1,7 +1,9 @@
 use std::{pin::Pin, rc::Rc, cell::RefCell, sync::{Arc, LazyLock}, collections::HashMap, task::{Context, Wake, Poll as StdPoll}};
 use crate::reactor::{Slab, TokenManager};
 use crate::time::Timer;
-use io_uring::IoUring;
+use io_uring::{IoUring, Probe};
+
+use super::IoUringTask;
 
 thread_local! {
     pub static TASK_QUEUE : LazyLock<Rc<RefCell<Vec<(u64, AsyncTask)>>>> = LazyLock::new(|| {
@@ -15,6 +17,13 @@ thread_local! {
     });
     pub static POLL : LazyLock<Rc<RefCell<IoUring>>> = LazyLock::new(|| {
         Rc::new(RefCell::new(IoUring::new(1024).unwrap()))
+    });
+    pub static PROBE : LazyLock<Rc<RefCell<Probe>>> = LazyLock::new(|| {
+        let mut probe = Probe::new();
+        POLL.with(|poll| {
+            poll.borrow_mut().submitter().register_probe(&mut probe);
+        });
+        Rc::new(RefCell::new(probe))
     });
     pub static TASKS : std::sync::LazyLock<Rc<RefCell<HashMap<u64, AsyncTask>>>> = LazyLock::new(|| {
         Rc::new(RefCell::new(HashMap::new()))
@@ -48,8 +57,8 @@ impl <'a> NoirRuntime<'a> {
             });
         });
         loop {
-            self.drain_queue();
             self.drain_completion();
+            self.drain_queue();
             let Some(result) = POLL.with(|poll| {
                 poll.borrow_mut().submit_and_wait(1).unwrap();
                 poll.borrow_mut().completion().next()
@@ -112,6 +121,7 @@ impl <'a> NoirRuntime<'a> {
             let mut tasks = tasks.borrow_mut();
             TASK_QUEUE.with(|queue| {
                 let mut queue = queue.borrow_mut();
+                println!("draining queue... {:?}", queue.iter().map(|x| x.0).collect::<Vec<_>>());
                 while let Some((token, mut task)) = queue.pop() {
                     let waker = std::task::Waker::from(Arc::new(Waker::new(token)));
                     let mut context = Context::from_waker(&waker);

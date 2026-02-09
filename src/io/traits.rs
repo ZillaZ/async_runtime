@@ -1,26 +1,28 @@
+use std::io::{Error, ErrorKind};
+
 pub trait AsyncRead {
-    fn read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync;
-    fn try_read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Option<Result<usize, std::io::Error>>> + Send + Sync;
+    fn read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<usize, Error>> + Send + Sync;
 }
 
 pub trait AsyncWrite {
-    fn write(&mut self, buffer: &[u8]) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync;
-    fn try_write(&mut self, buffer: &[u8]) -> impl Future<Output = Option<Result<usize, std::io::Error>>> + Send + Sync;
-    fn poll_shutdown(&mut self, how: u32) -> impl Future<Output = Result<(), std::io::Error>> + Send + Sync;
+    fn write(&mut self, buffer: &[u8]) -> impl Future<Output = Result<usize, Error>> + Send + Sync;
+    fn poll_shutdown(&mut self, how: u32) -> impl Future<Output = Result<(), Error>> + Send + Sync;
 }
 
 pub trait AsyncBufRead : AsyncRead {
-    fn fill_buf(&mut self) -> impl Future<Output = Result<&[u8], std::io::Error>> + Send + Sync;
+    fn fill_buf(&mut self) -> impl Future<Output = Result<&[u8], Error>> + Send + Sync;
     fn consume(&mut self, amount: usize) -> impl Future<Output = ()> + Send + Sync;
 
-    fn has_data_left(&mut self) -> impl Future<Output = Result<bool, std::io::Error>> + Send + Sync where Self: Send + Sync {
+    fn has_data_left(&mut self) -> impl Future<Output = Result<bool, Error>> + Send + Sync where Self: Send + Sync {
         async {
-            let bytes = self.fill_buf().await?;
+            let Ok(bytes) = self.fill_buf().await else {
+                return Ok(false);
+            };
             Ok(!bytes.is_empty())
         }
     }
 
-    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync where Self: Send + Sync {
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> impl Future<Output = Result<usize, Error>> + Send + Sync where Self: Send + Sync {
         async move {
             let mut consumed = 0;
             loop {
@@ -50,7 +52,7 @@ pub trait AsyncBufRead : AsyncRead {
         }
     }
 
-    fn skip_until(&mut self, byte: u8) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync where Self: Send + Sync {
+    fn skip_until(&mut self, byte: u8) -> impl Future<Output = Result<usize, Error>> + Send + Sync where Self: Send + Sync {
         async move {
             let mut consumed = 0;
             loop {
@@ -78,7 +80,7 @@ pub trait AsyncBufRead : AsyncRead {
         }
     }
 
-    fn read_line(&mut self, buf: &mut String) -> impl Future<Output = Result<usize, std::io::Error>> + Send + Sync where Self: Send + Sync {
+    fn read_line(&mut self, buf: &mut String) -> impl Future<Output = Result<usize, Error>> + Send + Sync where Self: Send + Sync {
         async {
             let mut consumed = 0;
             loop {
@@ -88,7 +90,7 @@ pub trait AsyncBufRead : AsyncRead {
                     Some((idx, _)) => {
                         consumed += idx;
                         let Ok(utf8_string) = str::from_utf8(&bytes[..idx]) else {
-                            return Err(std::io::ErrorKind::Other.into());
+                            return Err(ErrorKind::Other.into());
                         };
                         buf.push_str(utf8_string);
                         (idx + 1, true)
@@ -96,7 +98,7 @@ pub trait AsyncBufRead : AsyncRead {
                     None => {
                         consumed += bytes.len();
                         let Ok(utf8_string) = str::from_utf8(&bytes) else {
-                            return Err(std::io::ErrorKind::Other.into());
+                            return Err(ErrorKind::Other.into());
                         };
                         buf.push_str(utf8_string);
                         (bytes.len(), false)
