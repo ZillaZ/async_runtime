@@ -86,7 +86,6 @@ impl AsyncRead for TcpStream {
     fn read<'a>(&mut self, buffer: &'a mut[u8]) -> RecvMsg<'a> {
         let mut ret = RecvMsg::new(self.fd, vec![buffer]).unwrap();
         ret.recv_flags(libc::MSG_DONTWAIT as _);
-        ret.ioprio(1 << 0);
         ret
     }
 }

@@ -394,7 +394,7 @@ fn slab_index(waker: Waker) -> Index {
 
 fn slab_drop(index: Option<Index>) {
     if let Some(index) = index {
-        SLAB.try_with(|slab| slab.borrow_mut().clear_index(index));
+        let _ = SLAB.try_with(|slab| slab.borrow_mut().clear_index(index));
     }
 }
 

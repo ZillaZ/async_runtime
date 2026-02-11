@@ -160,9 +160,7 @@ where Mapper: (AsyncFn(Element) -> Ret) + Send + Sync,
     fn next(&mut self) -> impl Future<Output = Option<Self::Item>> {
        async {
            let m = &self.mapper;
-           let Some(n) = self.prev.next().await else {
-               return None;
-           };
+           let n = self.prev.next().await?;
            let result = m(n).await;
            Some(result)
        }
@@ -180,6 +178,7 @@ where Mapper: (AsyncFn(Element) -> Ret) + Send + Sync,
     }
 }
 
+#[derive(Clone)]
 pub struct Lines<R> where R: AsyncBufRead {
     r: R,
 }

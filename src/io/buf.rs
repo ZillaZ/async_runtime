@@ -1,6 +1,7 @@
 use crate::io::{AsyncBufRead, AsyncRead};
 use crate::net::TcpStream;
 
+#[derive(Clone)]
 pub struct BufReader<T> where T: Sized + AsyncRead {
     buffer: Vec<u8>,
     reader: T,
@@ -16,7 +17,20 @@ impl <T> AsyncBufRead for BufReader<T> where T: Sized + AsyncRead + Send + Sync 
     fn fill_buf(&mut self) -> impl Future<Output = Result<&[u8], std::io::Error>> {
         async {
             let mut buffer : &mut [u8] = &mut [0; 1024];
-            let bytes = self.read(&mut buffer).await?;
+            let result = self.read(&mut buffer).await;
+            if let Err(e) = result {
+                if let Some(err) = e.raw_os_error() {
+                    if err == -libc::EAGAIN {
+                        return if self.buffer.is_empty() {
+                            Err(e)
+                        }else{
+                            Ok(self.buffer.as_slice())
+                        }
+                    }
+                }
+                return Err(e);
+            }
+            let bytes = result.unwrap();
             self.buffer.extend(&buffer[..bytes]);
             Ok(self.buffer.as_slice())
         }
